@@ -1,0 +1,134 @@
+name: nightly-backup
+
+# Nightly encrypted logical backup of the Braves Supabase database to
+# Cloudflare R2. This repository is public only so that GitHub Actions minutes
+# are free; nothing in it, or in its run logs, may reveal credentials or data.
+#
+# - The dump is age-encrypted on the runner BEFORE it leaves, so R2 only ever
+#   holds ciphertext. The private key lives with the maintainer and is never in
+#   this repository or in GitHub secrets.
+# - There is deliberately NO artifact upload: artifacts of a public repository
+#   can be downloaded by any signed-in GitHub user. Manual restore-drill runs
+#   (which need an artifact tied to a Braves release commit) stay in the
+#   private braves-system repository's backup.yml.
+# - GitHub masks each secret's full value in logs, but not parts of it. The
+#   pooler host and user name inside SUPABASE_DB_URL are masked explicitly
+#   below, and aws runs with --only-show-errors so object listings stay out of
+#   the log.
+# - Only `schedule` and `workflow_dispatch` trigger this workflow. Secrets are
+#   never given to pull requests from forks.
+#
+# SUPABASE_DB_URL must be the SUPAVISOR SESSION-MODE POOLER string (port 5432),
+# not the IPv6-only direct connection string; GitHub runners are IPv4-only.
+#   postgresql://postgres.<project-ref>:<password>@aws-<region>.pooler.supabase.com:5432/postgres
+
+on:
+  schedule:
+    - cron: "17 18 * * *" # 02:17 SGT
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Only for the keep-alive step at the end.
+  actions: write
+
+env:
+  BUCKET: s3://braves-backups
+  # R2 has no regions ("auto") and rejects the extra integrity checksums
+  # aws-cli v2.23+ sends by default.
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Mask the parts of the connection string GitHub's own secret masking
+      # would miss (it only masks the whole URL). libpq names the host and user
+      # in connection errors. Runs before any step that could print them.
+      - name: mask connection details
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from urllib.parse import unquote, urlsplit
+          try:
+              parsed = urlsplit(os.environ.get("DB_URL", ""))
+              values = {parsed.hostname, parsed.username,
+                        parsed.username and unquote(parsed.username)}
+          except ValueError:
+              values = set()
+          for value in values:
+              if value:
+                  print(f"::add-mask::{value}")
+                  # The pooler user is postgres.<project-ref>; mask the ref too.
+                  if value.startswith("postgres."):
+                      print(f"::add-mask::{value.split('.', 1)[1]}")
+          PY
+
+      # pg_dump refuses to dump a server newer than itself; ubuntu-latest ships
+      # client 16 against a 17 server. Install and pin major 17 from PGDG.
+      - name: install pg_dump 17 + age
+        run: |
+          set -euo pipefail
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/pgdg.gpg
+          echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17 age > /dev/null
+          pg_dump --version
+          age --version
+          aws --version
+
+      - name: dump + encrypt + upload
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          # UTC stamp on purpose: 18:17 UTC is 02:17 SGT the next day, so the
+          # UTC date names the SGT day the dump completely contains.
+          F="braves-$(date -u +%F).dump"
+          # dump.py passes credentials to pg_dump through the environment, never
+          # argv, and redacts the user name and password from its output.
+          python3 tools/backup/dump.py "$F"
+          age -R supabase/backup-recipient.txt -o "$F.age" "$F" && rm "$F"
+          # A near-empty dump still exits 0; never let it displace a good one.
+          [ "$(stat -c%s "$F.age")" -gt 20000 ] || { echo "dump too small"; exit 1; }
+          aws s3 cp "$F.age" "$BUCKET/daily/" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          echo "uploaded $F.age ($(stat -c%s "$F.age") bytes)"
+
+      - name: retain (30 daily, 1 per month)
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          TODAY="braves-$(date -u +%F).dump.age"
+          MONTH="$(date -u +%Y-%m)"
+          # Promote whenever this month has no monthly copy yet, not only on the
+          # 1st, so one failed run cannot lose a month's long-term copy.
+          if ! aws s3 ls "$BUCKET/monthly/braves-$MONTH" --endpoint-url "$R2_ENDPOINT" | grep -q .; then
+            aws s3 cp "$BUCKET/daily/$TODAY" "$BUCKET/monthly/" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            echo "promoted $TODAY to monthly"
+          fi
+          # `head -n -30` (all but the newest 30) is GNU-only; fine on ubuntu.
+          aws s3 ls "$BUCKET/daily/" --endpoint-url "$R2_ENDPOINT" \
+            | sort | head -n -30 | awk '{print $4}' \
+            | xargs -r -I{} aws s3 rm "$BUCKET/daily/{}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+
+      # GitHub switches off scheduled workflows in a public repository after 60
+      # days without a commit. Re-enabling the workflow through the API on each
+      # run keeps the schedule alive without pushing keep-alive commits.
+      - name: keep schedule alive
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/nightly-backup.yml/enable" --silent
