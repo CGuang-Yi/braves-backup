@@ -1,0 +1,72 @@
+name: scrub-logs
+
+# Runs as soon as a nightly-backup run finishes: copies that run's logs to R2,
+# age-encrypted to the same public key as the backups, then deletes them from
+# GitHub. The run itself and its pass/fail status stay visible, and GitHub
+# still emails the owner when a scheduled run fails.
+#
+# To read a copied log: download logs/nightly-backup-<run id>.zip.age from R2
+# and decrypt it with the backup private key (`age -d -i <key file>`).
+#
+# This workflow's own log shows only the run ID it scrubbed. workflow_run
+# always runs this file from the default branch, never from a pull request.
+
+on:
+  workflow_run:
+    workflows: [nightly-backup]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: nightly-backup run ID whose logs to copy and delete
+        required: true
+
+permissions:
+  contents: read
+  # Download and delete the backup run's logs.
+  actions: write
+
+env:
+  BUCKET: s3://braves-backups
+  AWS_DEFAULT_REGION: auto
+  AWS_REQUEST_CHECKSUM_CALCULATION: when_required
+
+jobs:
+  scrub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install age
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq age > /dev/null
+
+      - name: copy logs to R2, then delete them
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "run ID must be numeric"; exit 1; }
+          # Only ever touch this repository's nightly-backup runs.
+          NAME="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID" --jq .name)"
+          [ "$NAME" = nightly-backup ] || { echo "run $RUN_ID is not nightly-backup"; exit 1; }
+          F="nightly-backup-$RUN_ID.zip"
+          # Logs can take a moment to be archived after a run completes.
+          for attempt in 1 2 3 4 5 6; do
+            if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/logs" > "$F" 2>/dev/null \
+               && unzip -tq "$F" > /dev/null 2>&1; then
+              break
+            fi
+            [ "$attempt" = 6 ] && { echo "logs for run $RUN_ID not available"; exit 1; }
+            sleep 20
+          done
+          age -R supabase/backup-recipient.txt -o "$F.age" "$F" && rm "$F"
+          # Delete from GitHub only after the encrypted copy is safely in R2.
+          aws s3 cp "$F.age" "$BUCKET/logs/" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+          gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/logs" --silent
+          echo "copied and deleted logs of run $RUN_ID"

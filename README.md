@@ -9,6 +9,9 @@ only so that GitHub Actions minutes are free.
   month.
 - `tools/backup/dump.py` is a copy of the same file in the private
   `braves-system` repository. Change both together.
+- `.github/workflows/scrub-logs.yml` runs after each backup: it copies the
+  run's logs to R2 under `logs/`, encrypted with the same public key, then
+  deletes them from GitHub. Log retention is also set to 1 day as a backstop.
 - Credentials live only in this repository's Actions secrets:
   `SUPABASE_DB_URL`, `R2_ACCESS_KEY`, `R2_SECRET_KEY`, `R2_ENDPOINT`.
 - The decryption key is never stored here. Restore steps and manual
